@@ -103,7 +103,7 @@ class NativeAaHandshakeManager(
             externalBtDiagnostic()?.let {
                 AppLog.w(it)
                 if (GocSppBridge.isAvailable()) {
-                    AppLog.i("NativeAA: ${GocSppBridge.SOCKET_PATH} exists — the handshake can go through the vendor Bluetooth daemon instead.")
+                    AppLog.i("NativeAA: ${GocSppBridge.socketPath} exists — the handshake can go through the vendor Bluetooth daemon instead.")
                     return true
                 }
                 if (!externalBtOverridden(context)) return false
@@ -287,7 +287,7 @@ class NativeAaHandshakeManager(
         // opened must not be reported as up.
         externalBtDiagnostic()?.let {
             if (GocSppBridge.isAvailable()) {
-                AppLog.w("$it\nNativeAA: ${GocSppBridge.SOCKET_PATH} exists — serving the handshake through the vendor Bluetooth daemon instead.")
+                AppLog.w("$it\nNativeAA: ${GocSppBridge.socketPath} exists — serving the handshake through the vendor Bluetooth daemon instead.")
                 startGocSppBridge()
                 return
             }
@@ -496,10 +496,10 @@ class NativeAaHandshakeManager(
         val link = try {
             GocSppLink.connect()
         } catch (e: Exception) {
-            AppLog.e("NativeAA: Could not open ${GocSppBridge.SOCKET_PATH}: ${e.message}")
+            AppLog.e("NativeAA: Could not open ${GocSppBridge.socketPath}: ${e.message}")
             return
         }
-        AppLog.i("NativeAA: Connected to ${GocSppBridge.SOCKET_PATH}; running the handshake over the vendor Bluetooth module.")
+        AppLog.i("NativeAA: Connected to ${GocSppBridge.socketPath}; running the handshake over the vendor Bluetooth module.")
         if (refuseWhileBackedOff(link)) return
         handleHandshake(link, localRadioName)
     }
