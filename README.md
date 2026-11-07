@@ -1,5 +1,5 @@
 # DiAuto
-
+ 
 **Android Auto on your BYD display. Wireless or USB.**
 
 > **BYD support scope:** These projects focus on BYD cars. They may work on other brands, but other brands are unsupported and there are no plans to add support or fix brand-specific incompatibilities.
