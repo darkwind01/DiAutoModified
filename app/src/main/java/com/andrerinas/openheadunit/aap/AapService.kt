@@ -1713,8 +1713,11 @@ class AapService : Service(), UsbReceiver.Listener {
                 // open would only churn the WiFi stack for nothing.
                 val externalBt = NativeAaHandshakeManager.externalBtDiagnostic()
                 if (externalBt != null) AppLog.e(externalBt)
+                // Not blocked where the vendor daemon's SPP socket exists: the handshake goes
+                // through it instead (see GocSppBridge).
                 val blockedByExternalBt =
-                    externalBt != null && !NativeAaHandshakeManager.externalBtOverridden(this)
+                    externalBt != null && !NativeAaHandshakeManager.externalBtOverridden(this) &&
+                        !com.andrerinas.openheadunit.connection.GocSppBridge.isAvailable()
                 if (!blockedByExternalBt) {
                     if (nativeTransport() == NativeTransport.LOCAL_HOTSPOT) {
                         localHotspotCredentialsProvider?.start()
