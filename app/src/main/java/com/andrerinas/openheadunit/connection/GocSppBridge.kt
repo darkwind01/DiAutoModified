@@ -82,9 +82,21 @@ object GocSppBridge {
     }
 }
 
-class GocSppLink private constructor(private val socket: LocalSocket, path: String) : HandshakeLink {
-    override val inputStream: InputStream = LoggingInputStream(socket.inputStream)
-    override val outputStream: OutputStream = LoggingOutputStream(socket.outputStream)
+/**
+ * One connection to the daemon's SPP socket.
+ *
+ * The daemon routes what it reads by a peer address at the start of each write: with none it logs
+ * `str_to_addr error: str: invalid` / `spp_socket_on_data error: spp error addr:` and drops the
+ * data. So every write goes out behind [prefix] — the phone's address by default — and a chunk the
+ * daemon hands back starting with the same prefix has it removed before the handshake sees it.
+ */
+class GocSppLink private constructor(
+    private val socket: LocalSocket,
+    path: String,
+    prefix: ByteArray,
+) : HandshakeLink {
+    override val inputStream: InputStream = PrefixedInputStream(socket.inputStream, prefix)
+    override val outputStream: OutputStream = PrefixedOutputStream(socket.outputStream, prefix)
     override val deviceName: String? = "vendor Bluetooth module"
     override val deviceAddress: String = path
 
@@ -95,40 +107,91 @@ class GocSppLink private constructor(private val socket: LocalSocket, path: Stri
     }
 
     companion object {
-        fun connect(): GocSppLink {
+        /**
+         * What goes in front of every write. `{mac}` is the phone's address as the daemon prints it
+         * (`40DE248C40B8`); `none` sends nothing. Settable over adb for experiments without a rebuild:
+         * `setprop persist.diauto.spp_prefix "{mac}"`.
+         */
+        private const val PREFIX_PROPERTY = "persist.diauto.spp_prefix"
+        private const val DEFAULT_PREFIX = "{mac}"
+
+        fun connect(phoneMac: String?): GocSppLink {
             val path = GocSppBridge.socketPath
+            val template = SystemProperties.get(PREFIX_PROPERTY, "")?.trim()?.ifEmpty { null } ?: DEFAULT_PREFIX
+            val prefixText = when {
+                template.equals("none", ignoreCase = true) -> ""
+                template.contains("{mac}") && phoneMac.isNullOrEmpty() -> {
+                    AppLog.w("GocSpp: The phone's address is not known yet; sending without a prefix.")
+                    ""
+                }
+                else -> template.replace("{mac}", phoneMac.orEmpty())
+            }
+            AppLog.i("GocSpp: Connecting to $path, prefix per write: '${prefixText.ifEmpty { "<none>" }}'")
             val socket = LocalSocket()
             socket.connect(LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM))
-            return GocSppLink(socket, path)
+            return GocSppLink(socket, path, prefixText.toByteArray(Charsets.US_ASCII))
         }
     }
 
-    private class LoggingInputStream(private val inner: InputStream) : InputStream() {
-        override fun read(): Int {
-            val value = inner.read()
-            if (value >= 0) GocSppBridge.logBytes("RX", byteArrayOf(value.toByte()), 0, 1)
-            return value
+    /**
+     * Hands the handshake whole chunks as the daemon delivered them, minus a leading [prefix].
+     * Buffered so a chunk is inspected once, however small the reads the handshake makes.
+     */
+    private class PrefixedInputStream(
+        private val inner: InputStream,
+        private val prefix: ByteArray,
+    ) : InputStream() {
+        private val chunk = ByteArray(4096)
+        private var pos = 0
+        private var end = 0
+
+        /** Returns false at end of stream. */
+        private fun fill(): Boolean {
+            while (pos >= end) {
+                val count = inner.read(chunk, 0, chunk.size)
+                if (count < 0) return false
+                if (count == 0) continue
+                GocSppBridge.logBytes("RX", chunk, 0, count)
+                pos = if (startsWithPrefix(count)) prefix.size else 0
+                end = count
+            }
+            return true
         }
 
+        private fun startsWithPrefix(count: Int): Boolean {
+            if (prefix.isEmpty() || count < prefix.size) return false
+            for (i in prefix.indices) if (chunk[i] != prefix[i]) return false
+            return true
+        }
+
+        override fun read(): Int = if (!fill()) -1 else chunk[pos++].toInt() and 0xff
+
         override fun read(b: ByteArray, off: Int, len: Int): Int {
-            val count = inner.read(b, off, len)
-            if (count > 0) GocSppBridge.logBytes("RX", b, off, count)
+            if (len == 0) return 0
+            if (!fill()) return -1
+            val count = minOf(len, end - pos)
+            System.arraycopy(chunk, pos, b, off, count)
+            pos += count
             return count
         }
 
-        override fun available(): Int = inner.available()
+        override fun available(): Int = end - pos
         override fun close() = inner.close()
     }
 
-    private class LoggingOutputStream(private val inner: OutputStream) : OutputStream() {
-        override fun write(b: Int) {
-            inner.write(b)
-            GocSppBridge.logBytes("TX", byteArrayOf(b.toByte()), 0, 1)
-        }
+    /** One write on the socket per message: [prefix] and the message together, never split. */
+    private class PrefixedOutputStream(
+        private val inner: OutputStream,
+        private val prefix: ByteArray,
+    ) : OutputStream() {
+        override fun write(b: Int) = write(byteArrayOf(b.toByte()), 0, 1)
 
         override fun write(b: ByteArray, off: Int, len: Int) {
-            inner.write(b, off, len)
-            GocSppBridge.logBytes("TX", b, off, len)
+            val packet = ByteArray(prefix.size + len)
+            System.arraycopy(prefix, 0, packet, 0, prefix.size)
+            System.arraycopy(b, off, packet, prefix.size, len)
+            inner.write(packet)
+            GocSppBridge.logBytes("TX", packet, 0, packet.size)
         }
 
         override fun flush() = inner.flush()
@@ -144,11 +207,13 @@ class GocSppLink private constructor(private val socket: LocalSocket, path: Stri
  * adb; without it nothing ever arrives here, and a warning says how to fix that.
  */
 class GocSppEventWatcher(
-    private val onConnected: () -> Unit,
+    private val onConnected: (phoneMac: String) -> Unit,
     private val onDisconnected: () -> Unit,
 ) {
     companion object {
-        private const val CONNECTED_MARKER = "on_spp_connected spp_num"
+        // The daemon logs each connection twice, "on_spp_connected spp_num=1" and then
+        // "on_spp_connected 40DE248C40B8"; the second carries the address every write must start with.
+        private val CONNECTED_WITH_MAC = Regex("on_spp_connected ([0-9A-Fa-f]{12})\\b")
         private const val DISCONNECTED_MARKER = "on_spp_disconnected spp_num"
 
         /** How long to see nothing at all from the vendor daemon before saying why. */
@@ -174,10 +239,12 @@ class GocSppEventWatcher(
                         while (isActive) {
                             val line = reader.readLine() ?: break
                             if (line.contains("nwdbt")) sawVendorLine = true
+                            val connected = CONNECTED_WITH_MAC.find(line)
                             when {
-                                line.contains(CONNECTED_MARKER) -> {
-                                    AppLog.i("GocSpp: The phone opened its SPP channel to the vendor Bluetooth module.")
-                                    onConnected()
+                                connected != null -> {
+                                    val mac = connected.groupValues[1].uppercase()
+                                    AppLog.i("GocSpp: The phone ($mac) opened its SPP channel to the vendor Bluetooth module.")
+                                    onConnected(mac)
                                 }
                                 line.contains(DISCONNECTED_MARKER) -> {
                                     AppLog.i("GocSpp: The phone closed its SPP channel to the vendor Bluetooth module.")
@@ -202,7 +269,7 @@ class GocSppEventWatcher(
                 AppLog.w(
                     "GocSpp: Nothing from the vendor Bluetooth daemon in ${SILENCE_WARNING_MS / 1000}s. " +
                         "This app most likely cannot read the system log. Grant it once over adb: " +
-                        "pm grant com.andrerinas.headunitrevived android.permission.READ_LOGS"
+                        "pm grant <this app's package> android.permission.READ_LOGS"
                 )
             }
         }
