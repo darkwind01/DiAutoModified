@@ -223,6 +223,12 @@ class NativeAaHandshakeManager(
     // so its SPP socket stands in for the RFCOMM listener and no Android Bluetooth is used at all.
     @Volatile private var gocSppMode = false
     private var gocSppWatcher: GocSppEventWatcher? = null
+    private var gocSppLoop: Job? = null
+    // The socket opened ahead of the phone, so the daemon has a client to pair the phone's link with.
+    @Volatile private var gocSppActiveLink: GocSppLink? = null
+    // The same socket while a handshake runs on it. Only this one is closed when the phone drops:
+    // a drop arriving after a handshake already ended must not close the fresh, still-waiting socket.
+    @Volatile private var gocSppHandshakeLink: GocSppLink? = null
 
     /** Polls until the AAP TCP port is bound, or [timeoutMs] passes. */
     private suspend fun awaitWirelessServerListening(timeoutMs: Long): Boolean {
@@ -476,32 +482,54 @@ class NativeAaHandshakeManager(
         gocSppMode = true
         aaListenersClosedForSession = false
         localRadioName = "vendor module"
-        AppLog.i("NativeAA: Waiting for the phone to open its Android Auto channel on the vendor Bluetooth module...")
+        AppLog.i("NativeAA: Waiting for the phone to open its Android Auto channel on the vendor Bluetooth module (${GocSppBridge.socketPath})...")
+        // Conflated: only the latest connection matters, an older one has already been dropped.
+        val phoneConnected = Channel<String>(Channel.CONFLATED)
         val watcher = GocSppEventWatcher(
-            onConnected = { phoneMac ->
-                scope.launch(Dispatchers.IO + CoroutineName("NativeAa-Handshake-GocSpp")) {
-                    serveGocSppConnection(phoneMac)
-                }
-            },
+            onConnected = { phoneMac -> phoneConnected.trySend(phoneMac) },
             onDisconnected = {
+                // Ends the handshake on this link so the loop below opens a fresh one in time for
+                // the phone's next attempt, ~12 s later.
                 AppLog.d("NativeAA: Vendor module reports the phone's channel closed.")
+                gocSppHandshakeLink?.close()
             }
         )
         gocSppWatcher = watcher
         watcher.start(scope)
-    }
 
-    private suspend fun serveGocSppConnection(phoneMac: String) {
-        if (!isRunning || aaListenersClosedForSession) return
-        val link = try {
-            GocSppLink.connect(phoneMac)
-        } catch (e: Exception) {
-            AppLog.e("NativeAA: Could not open ${GocSppBridge.socketPath}: ${e.message}")
-            return
+        gocSppLoop = scope.launch(Dispatchers.IO + CoroutineName("NativeAa-GocSppLoop")) {
+            while (isActive && isRunning && !aaListenersClosedForSession) {
+                val link = try {
+                    GocSppLink.connect()
+                } catch (e: Exception) {
+                    AppLog.w("NativeAA: Could not open ${GocSppBridge.socketPath}: ${e.message}. Retrying in 3s.")
+                    delay(3000)
+                    continue
+                }
+                gocSppActiveLink = link
+                // A connection announced before this socket existed was paired with nobody; wait
+                // for the next one rather than talking to a link the daemon will not route.
+                while (phoneConnected.tryReceive().isSuccess) { /* drop */ }
+                val phoneMac = phoneConnected.receive()
+                if (!isRunning || aaListenersClosedForSession) {
+                    link.close()
+                    break
+                }
+                link.bindPhone(phoneMac)
+                if (refuseWhileBackedOff(link)) {
+                    gocSppActiveLink = null
+                    continue
+                }
+                gocSppHandshakeLink = link
+                try {
+                    handleHandshake(link, localRadioName)
+                } finally {
+                    gocSppHandshakeLink = null
+                    gocSppActiveLink = null
+                }
+                delay(300)
+            }
         }
-        AppLog.i("NativeAA: Connected to ${GocSppBridge.socketPath}; running the handshake over the vendor Bluetooth module.")
-        if (refuseWhileBackedOff(link)) return
-        handleHandshake(link, localRadioName)
     }
 
     /**
@@ -1501,6 +1529,10 @@ class NativeAaHandshakeManager(
         isRunning = false
         gocSppWatcher?.stop()
         gocSppWatcher = null
+        gocSppLoop?.cancel()
+        gocSppLoop = null
+        gocSppActiveLink?.close()
+        gocSppActiveLink = null
         gocSppMode = false
         try { aaServerSocket?.close() } catch (e: Exception) {}
         try { hfpServerSocket?.close() } catch (e: Exception) {}
