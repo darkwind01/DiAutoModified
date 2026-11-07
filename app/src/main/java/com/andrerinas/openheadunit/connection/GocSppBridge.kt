@@ -6,6 +6,7 @@ import android.net.LocalSocket
 import android.net.LocalSocketAddress
 import android.os.SystemClock
 import com.andrerinas.openheadunit.utils.AppLog
+import com.andrerinas.openheadunit.utils.SystemProperties
 import kotlinx.coroutines.CoroutineName
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -51,11 +52,20 @@ class BluetoothHandshakeLink(val socket: BluetoothSocket) : HandshakeLink {
 object GocSppBridge {
     const val SOCKET_PATH = "/dev/socket/goc_spp"
 
+    /**
+     * Lets the socket be switched over adb without a rebuild, e.g. to the one the vendor's own
+     * projection app uses: `setprop persist.diauto.spp_socket /dev/socket/zj_bt_socket`.
+     */
+    private const val SOCKET_PROPERTY = "persist.diauto.spp_socket"
+
     /** Bytes shown per logged chunk; the handshake messages are all well under this. */
     private const val MAX_LOGGED_BYTES = 256
     private val HEX = "0123456789ABCDEF".toCharArray()
 
-    fun isAvailable(): Boolean = try { File(SOCKET_PATH).exists() } catch (e: Exception) { false }
+    val socketPath: String
+        get() = SystemProperties.get(SOCKET_PROPERTY, "")?.trim()?.ifEmpty { null } ?: SOCKET_PATH
+
+    fun isAvailable(): Boolean = try { File(socketPath).exists() } catch (e: Exception) { false }
 
     internal fun logBytes(direction: String, data: ByteArray, off: Int, len: Int) {
         val shown = minOf(len, MAX_LOGGED_BYTES)
@@ -72,11 +82,11 @@ object GocSppBridge {
     }
 }
 
-class GocSppLink private constructor(private val socket: LocalSocket) : HandshakeLink {
+class GocSppLink private constructor(private val socket: LocalSocket, path: String) : HandshakeLink {
     override val inputStream: InputStream = LoggingInputStream(socket.inputStream)
     override val outputStream: OutputStream = LoggingOutputStream(socket.outputStream)
     override val deviceName: String? = "vendor Bluetooth module"
-    override val deviceAddress: String = GocSppBridge.SOCKET_PATH
+    override val deviceAddress: String = path
 
     override fun close() {
         // shutdownInput first: close() alone does not always wake a thread blocked in read().
@@ -86,9 +96,10 @@ class GocSppLink private constructor(private val socket: LocalSocket) : Handshak
 
     companion object {
         fun connect(): GocSppLink {
+            val path = GocSppBridge.socketPath
             val socket = LocalSocket()
-            socket.connect(LocalSocketAddress(GocSppBridge.SOCKET_PATH, LocalSocketAddress.Namespace.FILESYSTEM))
-            return GocSppLink(socket)
+            socket.connect(LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM))
+            return GocSppLink(socket, path)
         }
     }
 
