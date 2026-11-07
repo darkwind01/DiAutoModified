@@ -102,6 +102,10 @@ class NativeAaHandshakeManager(
         fun checkCompatibility(context: Context): Boolean {
             externalBtDiagnostic()?.let {
                 AppLog.w(it)
+                if (GocSppBridge.isAvailable()) {
+                    AppLog.i("NativeAA: ${GocSppBridge.SOCKET_PATH} exists — the handshake can go through the vendor Bluetooth daemon instead.")
+                    return true
+                }
                 if (!externalBtOverridden(context)) return false
                 AppLog.w("NativeAA: continuing anyway — a secondary Bluetooth service is configured manually.")
             }
@@ -192,7 +196,7 @@ class NativeAaHandshakeManager(
     // The socket of the handshake currently being served. Kept so a phone that gives up and
     // reconnects over Bluetooth during a settle supersedes the stale one instead of running a
     // second handleHandshake() alongside it.
-    @Volatile private var activeHandshakeSocket: BluetoothSocket? = null
+    @Volatile private var activeHandshakeSocket: HandshakeLink? = null
     // The coroutine serving [activeHandshakeSocket]. Closing a superseded handshake's socket only
     // ends it on stacks where close() interrupts a pending read; some do not, and it runs on for
     // minutes. Cancelling cannot break a blocking JNI read either, but it does end every real
@@ -215,6 +219,10 @@ class NativeAaHandshakeManager(
     // Whether the "not serving handshakes" warning has already been logged for the current
     // backoff, so a phone retrying every ~12 s does not repeat the long explanation each time.
     @Volatile private var loggedHandshakeBackoff = false
+    // Units whose Bluetooth is an external module: the phone's channel ends in the vendor daemon,
+    // so its SPP socket stands in for the RFCOMM listener and no Android Bluetooth is used at all.
+    @Volatile private var gocSppMode = false
+    private var gocSppWatcher: GocSppEventWatcher? = null
 
     /** Polls until the AAP TCP port is bound, or [timeoutMs] passes. */
     private suspend fun awaitWirelessServerListening(timeoutMs: Long): Boolean {
@@ -278,6 +286,11 @@ class NativeAaHandshakeManager(
         // see this as genuinely stopped. Nothing here is retryable, but a listener that was never
         // opened must not be reported as up.
         externalBtDiagnostic()?.let {
+            if (GocSppBridge.isAvailable()) {
+                AppLog.w("$it\nNativeAA: ${GocSppBridge.SOCKET_PATH} exists — serving the handshake through the vendor Bluetooth daemon instead.")
+                startGocSppBridge()
+                return
+            }
             if (!externalBtOverridden(context)) {
                 AppLog.e(it)
                 return
@@ -321,10 +334,11 @@ class NativeAaHandshakeManager(
                     val socket = aaServerSocket?.accept()
                     if (socket != null) {
                         AppLog.i("NativeAA: Connection accepted from ${socket.remoteDevice.name} (${socket.remoteDevice.address}) on local radio [$localRadioName]")
-                        if (refuseWhileBackedOff(socket)) continue
+                        val link = BluetoothHandshakeLink(socket)
+                        if (refuseWhileBackedOff(link)) continue
                         // [FIX] Launch handshake in a separate coroutine so the server can accept the next connection!
                         scope.launch(Dispatchers.IO + CoroutineName("NativeAa-Handshake-${socket.remoteDevice.address}")) {
-                            handleHandshake(socket, localRadioName)
+                            handleHandshake(link, localRadioName)
                         }
                     }
                 }
@@ -416,9 +430,10 @@ class NativeAaHandshakeManager(
                     val socket = server.accept()
                     if (socket != null) {
                         AppLog.i("NativeAA: Connection accepted (secondary radio '$serviceName' [$radioName]) from ${socket.remoteDevice.name} (${socket.remoteDevice.address})")
-                        if (refuseWhileBackedOff(socket)) continue
+                        val link = BluetoothHandshakeLink(socket)
+                        if (refuseWhileBackedOff(link)) continue
                         scope.launch(Dispatchers.IO + CoroutineName("NativeAa-Handshake-${socket.remoteDevice.address}")) {
-                            handleHandshake(socket, radioName)
+                            handleHandshake(link, radioName)
                         }
                     }
                 }
@@ -446,6 +461,47 @@ class NativeAaHandshakeManager(
                 else AppLog.d("NativeAA: Secondary HFP server closed cleanly ['$serviceName' $radioName].")
             }
         }
+    }
+
+    /**
+     * The route for units whose Bluetooth is an external module (see [GocSppBridge]). The phone
+     * keeps its own Bluetooth link to the vendor module and opens the Android Auto channel on its
+     * own every ~12 s, so there is nothing to listen on and nothing to poke: each time the daemon
+     * reports the channel open, connect to its SPP socket and run the normal handshake over it.
+     *
+     * The vendor's own projection app must not be running, or it takes the channel first.
+     */
+    private fun startGocSppBridge() {
+        isRunning = true
+        gocSppMode = true
+        aaListenersClosedForSession = false
+        localRadioName = "vendor module"
+        AppLog.i("NativeAA: Waiting for the phone to open its Android Auto channel on the vendor Bluetooth module...")
+        val watcher = GocSppEventWatcher(
+            onConnected = {
+                scope.launch(Dispatchers.IO + CoroutineName("NativeAa-Handshake-GocSpp")) {
+                    serveGocSppConnection()
+                }
+            },
+            onDisconnected = {
+                AppLog.d("NativeAA: Vendor module reports the phone's channel closed.")
+            }
+        )
+        gocSppWatcher = watcher
+        watcher.start(scope)
+    }
+
+    private suspend fun serveGocSppConnection() {
+        if (!isRunning || aaListenersClosedForSession) return
+        val link = try {
+            GocSppLink.connect()
+        } catch (e: Exception) {
+            AppLog.e("NativeAA: Could not open ${GocSppBridge.SOCKET_PATH}: ${e.message}")
+            return
+        }
+        AppLog.i("NativeAA: Connected to ${GocSppBridge.SOCKET_PATH}; running the handshake over the vendor Bluetooth module.")
+        if (refuseWhileBackedOff(link)) return
+        handleHandshake(link, localRadioName)
     }
 
     /**
@@ -661,6 +717,12 @@ class NativeAaHandshakeManager(
      * re-delivery. That put a real RFCOMM connect() in the middle of the phone's DHCP exchange.
      */
     fun triggerPoke() {
+        if (gocSppMode) {
+            // The phone is bonded to the vendor module and reconnects to it by itself; a poke over
+            // the Android radio could only reach nothing.
+            AppLog.d("NativeAA: Not poking — the handshake runs through the vendor Bluetooth module.")
+            return
+        }
         if (isHandoffSettling()) {
             // Info, not debug: this line is the evidence the suppression is working, and reporter
             // logs default to INFO.
@@ -790,6 +852,12 @@ class NativeAaHandshakeManager(
      * Start a manual poke (wakeup) for a specific Bluetooth device.
      */
     fun manualPoke(address: String) {
+        if (gocSppMode) {
+            // Still honour the user's "try again": it is the way out of a handshake backoff.
+            resetHandshakeBackoff()
+            AppLog.i("NativeAA: Manual poke skipped — the handshake runs through the vendor Bluetooth module; backoff cleared.")
+            return
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             if (ContextCompat.checkSelfPermission(context, android.Manifest.permission.BLUETOOTH_CONNECT) 
                 != PackageManager.PERMISSION_GRANTED) {
@@ -837,7 +905,7 @@ class NativeAaHandshakeManager(
      * is stop starting new ones. The phone will keep reconnecting; closing immediately costs it
      * nothing beyond the retry it was going to make anyway.
      */
-    private fun refuseWhileBackedOff(socket: BluetoothSocket): Boolean {
+    private fun refuseWhileBackedOff(socket: HandshakeLink): Boolean {
         if (NativeHandoffPolicy.shouldServeHandshake(consecutiveHandshakeFailures)) return false
         if (!loggedHandshakeBackoff) {
             loggedHandshakeBackoff = true
@@ -868,11 +936,11 @@ class NativeAaHandshakeManager(
      * on for minutes — and its late writes would clear the live session's settling stamp, cancel
      * its poke, close listeners it still needs, or wipe a backoff it had legitimately earned.
      */
-    private inline fun ifOwner(socket: BluetoothSocket, block: () -> Unit) {
+    private inline fun ifOwner(socket: HandshakeLink, block: () -> Unit) {
         if (activeHandshakeSocket === socket) block()
     }
 
-    private suspend fun handleHandshake(socket: BluetoothSocket, localRadio: String? = null) = withContext(Dispatchers.IO) {
+    private suspend fun handleHandshake(socket: HandshakeLink, localRadio: String? = null) = withContext(Dispatchers.IO) {
         // The phone reached us. Recorded here rather than at either accept site so both the
         // primary and the secondary-radio loops are covered by one statement.
         everAcceptedAaConnection = true
@@ -926,8 +994,9 @@ class NativeAaHandshakeManager(
         val inbound = Channel<ProtobufMessage>(Channel.UNLIMITED)
         var readerJob: Job? = null
         try {
-            val device = socket.remoteDevice
-            AppLog.i("NativeAA: Handling handshake for ${device.name} (${device.address}) on local radio [${localRadio ?: "?"}]")
+            val deviceName = socket.deviceName
+            val deviceAddress = socket.deviceAddress
+            AppLog.i("NativeAA: Handling handshake for $deviceName ($deviceAddress) on local radio [${localRadio ?: "?"}]")
 
             if (commManager.isConnected ||
                 commManager.connectionState.value is CommManager.ConnectionState.Connecting) {
@@ -938,12 +1007,14 @@ class NativeAaHandshakeManager(
             }
 
             val macs = settings.autoStartBluetoothDeviceMacs
-            // Never add back a phone the user took off the list (#35).
-            if (!macs.contains(device.address) && device.address !in settings.autoStartBluetoothDeviceMacsRemoved) {
-                AppLog.i("NativeAA: Saving ${device.address} (${device.name}) to the list of auto-start devices.")
-                val newMacs = macs + device.address
+            // Only a real Bluetooth peer has a MAC worth remembering; the vendor module's socket
+            // path is not one. Never add back a phone the user took off the list (#35).
+            if (socket is BluetoothHandshakeLink &&
+                !macs.contains(deviceAddress) && deviceAddress !in settings.autoStartBluetoothDeviceMacsRemoved) {
+                AppLog.i("NativeAA: Saving $deviceAddress ($deviceName) to the list of auto-start devices.")
+                val newMacs = macs + deviceAddress
                 settings.autoStartBluetoothDeviceMacs = newMacs
-                settings.autoStartBluetoothDeviceName = device.name ?: "Unknown Device"
+                settings.autoStartBluetoothDeviceName = deviceName ?: "Unknown Device"
                 com.andrerinas.openheadunit.utils.Settings.syncAutoStartBtMacsToDeviceStorage(context, newMacs)
             }
 
@@ -957,7 +1028,7 @@ class NativeAaHandshakeManager(
             // *wait* instead: read on a coroutine of its own and take messages from a channel,
             // which resumes on schedule whether or not the read ever returns. The reader itself is
             // still unreclaimable on such a stack; consecutiveHandshakeFailures bounds that.
-            readerJob = scope.launch(Dispatchers.IO + CoroutineName("NativeAa-Reader-${device.address}")) {
+            readerJob = scope.launch(Dispatchers.IO + CoroutineName("NativeAa-Reader-$deviceAddress")) {
                 try {
                     while (isActive) inbound.send(readProtobuf(input))
                 } catch (e: Exception) {
@@ -1428,6 +1499,9 @@ class NativeAaHandshakeManager(
 
     fun stop() {
         isRunning = false
+        gocSppWatcher?.stop()
+        gocSppWatcher = null
+        gocSppMode = false
         try { aaServerSocket?.close() } catch (e: Exception) {}
         try { hfpServerSocket?.close() } catch (e: Exception) {}
         synchronized(extraAaServerSockets) {
