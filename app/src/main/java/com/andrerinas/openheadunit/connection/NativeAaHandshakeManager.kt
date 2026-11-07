@@ -478,9 +478,9 @@ class NativeAaHandshakeManager(
         localRadioName = "vendor module"
         AppLog.i("NativeAA: Waiting for the phone to open its Android Auto channel on the vendor Bluetooth module...")
         val watcher = GocSppEventWatcher(
-            onConnected = {
+            onConnected = { phoneMac ->
                 scope.launch(Dispatchers.IO + CoroutineName("NativeAa-Handshake-GocSpp")) {
-                    serveGocSppConnection()
+                    serveGocSppConnection(phoneMac)
                 }
             },
             onDisconnected = {
@@ -491,10 +491,10 @@ class NativeAaHandshakeManager(
         watcher.start(scope)
     }
 
-    private suspend fun serveGocSppConnection() {
+    private suspend fun serveGocSppConnection(phoneMac: String) {
         if (!isRunning || aaListenersClosedForSession) return
         val link = try {
-            GocSppLink.connect()
+            GocSppLink.connect(phoneMac)
         } catch (e: Exception) {
             AppLog.e("NativeAA: Could not open ${GocSppBridge.socketPath}: ${e.message}")
             return
