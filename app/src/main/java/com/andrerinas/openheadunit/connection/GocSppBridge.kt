@@ -85,18 +85,20 @@ object GocSppBridge {
 /**
  * One connection to the daemon's SPP socket.
  *
- * The daemon routes what it reads by a peer address at the start of each write: with none it logs
- * `str_to_addr error: str: invalid` / `spp_socket_on_data error: spp error addr:` and drops the
- * data. So every write goes out behind [prefix] — the phone's address by default — and a chunk the
- * daemon hands back starting with the same prefix has it removed before the handshake sees it.
+ * The daemon pairs a phone's SPP link with a client that is *already* connected when the link comes
+ * up (`spp_socket connect succeed,addr is:...`; with none it logs `spp connected with no socket`),
+ * and drops data from a client it has not paired (`spp_socket_on_data error: spp error addr:`). So
+ * the link is opened ahead of the phone and kept, and [bindPhone] is called once the phone shows up.
+ *
+ * An optional per-write prefix is kept for experiments; it is off by default.
  */
 class GocSppLink private constructor(
     private val socket: LocalSocket,
     path: String,
-    prefix: ByteArray,
 ) : HandshakeLink {
-    override val inputStream: InputStream = PrefixedInputStream(socket.inputStream, prefix)
-    override val outputStream: OutputStream = PrefixedOutputStream(socket.outputStream, prefix)
+    @Volatile private var prefix: ByteArray = ByteArray(0)
+    override val inputStream: InputStream = PrefixedInputStream(socket.inputStream) { prefix }
+    override val outputStream: OutputStream = PrefixedOutputStream(socket.outputStream) { prefix }
     override val deviceName: String? = "vendor Bluetooth module"
     override val deviceAddress: String = path
 
@@ -106,40 +108,48 @@ class GocSppLink private constructor(
         try { socket.close() } catch (e: Exception) {}
     }
 
+    /** Records which phone this link now serves, and applies the prefix setting for it. */
+    fun bindPhone(phoneMac: String) {
+        val template = SystemProperties.get(PREFIX_PROPERTY, "")?.trim()?.ifEmpty { null } ?: DEFAULT_PREFIX
+        val text = if (template.equals("none", ignoreCase = true)) "" else expand(template, phoneMac)
+        prefix = text.toByteArray(Charsets.ISO_8859_1)
+        AppLog.i("GocSpp: Serving phone $phoneMac on $deviceAddress, prefix per write: '${if (text.isEmpty()) "<none>" else template}'")
+    }
+
     companion object {
         /**
-         * What goes in front of every write. `{mac}` is the phone's address as the daemon prints it
-         * (`40DE248C40B8`); `none` sends nothing. Settable over adb for experiments without a rebuild:
-         * `setprop persist.diauto.spp_prefix "{mac}"`.
+         * What goes in front of every write, for experiments without a rebuild:
+         * `setprop persist.diauto.spp_prefix "{macc}\0"`. `{mac}` is the phone's address as
+         * `40DE248C40B8`, `{macc}` the same as `40DE:24:8C40B8` (the form the daemon parses), and
+         * `\0` a NUL byte. `none`, the default, sends nothing.
          */
         private const val PREFIX_PROPERTY = "persist.diauto.spp_prefix"
-        private const val DEFAULT_PREFIX = "{mac}"
+        private const val DEFAULT_PREFIX = "none"
 
-        fun connect(phoneMac: String?): GocSppLink {
+        private fun expand(template: String, mac: String): String {
+            val colon = if (mac.length == 12) "${mac.substring(0, 4)}:${mac.substring(4, 6)}:${mac.substring(6)}" else mac
+            return template
+                .replace("{macc}", colon)
+                .replace("{mac}", mac)
+                .replace("\\0", "\u0000")
+        }
+
+        fun connect(): GocSppLink {
             val path = GocSppBridge.socketPath
-            val template = SystemProperties.get(PREFIX_PROPERTY, "")?.trim()?.ifEmpty { null } ?: DEFAULT_PREFIX
-            val prefixText = when {
-                template.equals("none", ignoreCase = true) -> ""
-                template.contains("{mac}") && phoneMac.isNullOrEmpty() -> {
-                    AppLog.w("GocSpp: The phone's address is not known yet; sending without a prefix.")
-                    ""
-                }
-                else -> template.replace("{mac}", phoneMac.orEmpty())
-            }
-            AppLog.i("GocSpp: Connecting to $path, prefix per write: '${prefixText.ifEmpty { "<none>" }}'")
             val socket = LocalSocket()
             socket.connect(LocalSocketAddress(path, LocalSocketAddress.Namespace.FILESYSTEM))
-            return GocSppLink(socket, path, prefixText.toByteArray(Charsets.US_ASCII))
+            AppLog.i("GocSpp: Connected to $path; waiting for the phone.")
+            return GocSppLink(socket, path)
         }
     }
 
     /**
-     * Hands the handshake whole chunks as the daemon delivered them, minus a leading [prefix].
+     * Hands the handshake whole chunks as the daemon delivered them, minus a leading prefix.
      * Buffered so a chunk is inspected once, however small the reads the handshake makes.
      */
     private class PrefixedInputStream(
         private val inner: InputStream,
-        private val prefix: ByteArray,
+        private val currentPrefix: () -> ByteArray,
     ) : InputStream() {
         private val chunk = ByteArray(4096)
         private var pos = 0
@@ -152,13 +162,14 @@ class GocSppLink private constructor(
                 if (count < 0) return false
                 if (count == 0) continue
                 GocSppBridge.logBytes("RX", chunk, 0, count)
-                pos = if (startsWithPrefix(count)) prefix.size else 0
+                val prefix = currentPrefix()
+                pos = if (startsWith(prefix, count)) prefix.size else 0
                 end = count
             }
             return true
         }
 
-        private fun startsWithPrefix(count: Int): Boolean {
+        private fun startsWith(prefix: ByteArray, count: Int): Boolean {
             if (prefix.isEmpty() || count < prefix.size) return false
             for (i in prefix.indices) if (chunk[i] != prefix[i]) return false
             return true
@@ -179,14 +190,15 @@ class GocSppLink private constructor(
         override fun close() = inner.close()
     }
 
-    /** One write on the socket per message: [prefix] and the message together, never split. */
+    /** One write on the socket per message: the prefix and the message together, never split. */
     private class PrefixedOutputStream(
         private val inner: OutputStream,
-        private val prefix: ByteArray,
+        private val currentPrefix: () -> ByteArray,
     ) : OutputStream() {
         override fun write(b: Int) = write(byteArrayOf(b.toByte()), 0, 1)
 
         override fun write(b: ByteArray, off: Int, len: Int) {
+            val prefix = currentPrefix()
             val packet = ByteArray(prefix.size + len)
             System.arraycopy(prefix, 0, packet, 0, prefix.size)
             System.arraycopy(b, off, packet, prefix.size, len)
